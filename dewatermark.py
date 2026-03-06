@@ -20,6 +20,7 @@ from tqdm import tqdm
 DEFAULT_MODEL_DIR = os.path.join(os.path.expanduser("~"), ".cache", "dewatermark")
 LAMA_REPO = "Carve/LaMa-ONNX"
 LAMA_FILE = "lama_fp32.onnx"
+LAMA_COREML_PATH = os.path.join(DEFAULT_MODEL_DIR, "lama_fp16.mlpackage")
 YOLO_REPO = "qfisch/yolov8n-watermark-detection"
 YOLO_FILE = "yolov8n-watermark.onnx"
 
@@ -332,8 +333,8 @@ def _inpaint_frame_cv(args):
 
 
 def _inpaint_frame_lama(args):
-    """Worker: load frame, inpaint with LaMa ONNX, save back."""
-    frame_path, lama_model_path, crop_box, mask_crop_norm, mask_input, alpha_crop = args
+    """Worker: load frame, inpaint with LaMa (CoreML or ONNX), save back."""
+    frame_path, lama_model_path, crop_box, mask_crop_norm, mask_input, alpha_crop, use_coreml = args
     x1, y1, x2, y2 = crop_box
     crop_w = x2 - x1
     crop_h = y2 - y1
@@ -345,15 +346,20 @@ def _inpaint_frame_lama(args):
     crop = frame[y1:y2, x1:x2].copy()
     crop_resized = cv2.resize(crop, (512, 512), interpolation=cv2.INTER_LINEAR)
     crop_input = crop_resized.astype(np.float32) / 255.0
-    crop_input = np.transpose(crop_input, (2, 0, 1))[np.newaxis, ...]
+    crop_nchw = np.transpose(crop_input, (2, 0, 1))[np.newaxis, ...]  # (1,3,512,512)
 
-    session = _get_worker_session(lama_model_path)
-    input_name = session.get_inputs()[0].name
-    mask_name = session.get_inputs()[1].name
+    if use_coreml:
+        coreml_model = _get_worker_coreml(lama_model_path)
+        pred = coreml_model.predict({"image": crop_nchw, "mask": mask_input})
+        inpainted = list(pred.values())[0][0]  # (3,512,512)
+    else:
+        session = _get_worker_onnx(lama_model_path)
+        input_name = session.get_inputs()[0].name
+        mask_name = session.get_inputs()[1].name
+        result = session.run(None, {input_name: crop_nchw, mask_name: mask_input})
+        inpainted = result[0][0]  # (3,512,512)
 
-    result = session.run(None, {input_name: crop_input, mask_name: mask_input})
-    inpainted = result[0][0]
-    inpainted = np.transpose(inpainted, (1, 2, 0))
+    inpainted = np.transpose(inpainted, (1, 2, 0))  # (512,512,3)
     inpainted = np.clip(inpainted * 255, 0, 255).astype(np.uint8)
     inpainted_resized = cv2.resize(inpainted, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
 
@@ -365,15 +371,25 @@ def _inpaint_frame_lama(args):
     return frame_path
 
 
-_worker_session_cache = {}
+_worker_onnx_cache = {}
+_worker_coreml_cache = {}
 
 
-def _get_worker_session(model_path):
+def _get_worker_onnx(model_path):
     """Per-process cached ONNX session."""
     pid = os.getpid()
-    if pid not in _worker_session_cache:
-        _worker_session_cache[pid] = _ort_session(model_path)
-    return _worker_session_cache[pid]
+    if pid not in _worker_onnx_cache:
+        _worker_onnx_cache[pid] = _ort_session(model_path)
+    return _worker_onnx_cache[pid]
+
+
+def _get_worker_coreml(model_path):
+    """Per-process cached CoreML model."""
+    pid = os.getpid()
+    if pid not in _worker_coreml_cache:
+        import coremltools as ct
+        _worker_coreml_cache[pid] = ct.models.MLModel(model_path)
+    return _worker_coreml_cache[pid]
 
 
 def process_video(input_path, output_path, mask_float, crop_box, info, crf, preset, workers,
@@ -409,16 +425,19 @@ def process_video(input_path, output_path, mask_float, crop_box, info, crf, pres
 
         # Step 2: Parallel inpaint
         if use_lama and lama_model_path:
+            use_coreml = os.path.exists(LAMA_COREML_PATH)
             mask_crop_norm = mask_crop / 255.0
             mask_512 = cv2.resize(mask_crop_norm, (512, 512), interpolation=cv2.INTER_LINEAR)
             mask_512_bin = (mask_512 > 0.1).astype(np.float32)
             mask_input = mask_512_bin[np.newaxis, np.newaxis, ...]
             alpha_crop = np.stack([mask_crop_norm] * 3, axis=-1)
+            actual_model_path = LAMA_COREML_PATH if use_coreml else lama_model_path
             task_args = [
-                (str(f), lama_model_path, crop_box, mask_crop_norm, mask_input, alpha_crop)
+                (str(f), actual_model_path, crop_box, mask_crop_norm, mask_input, alpha_crop, use_coreml)
                 for f in frame_files
             ]
-            print(f"Inpainting with LaMa ({workers} workers)...")
+            backend = "CoreML" if use_coreml else "ONNX"
+            print(f"Inpainting with LaMa {backend} ({workers} workers)...")
             worker_fn = _inpaint_frame_lama
         else:
             task_args = [(str(f), mask_u8) for f in frame_files]
