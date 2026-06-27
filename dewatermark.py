@@ -21,6 +21,7 @@ DEFAULT_MODEL_DIR = os.path.join(os.path.expanduser("~"), ".cache", "dewatermark
 LAMA_REPO = "Carve/LaMa-ONNX"
 LAMA_FILE = "lama_fp32.onnx"
 LAMA_COREML_PATH = os.path.join(DEFAULT_MODEL_DIR, "lama_fp16.mlpackage")
+LAMA_MLX_PATH = os.path.join(DEFAULT_MODEL_DIR, "lama_mlx.npz")
 YOLO_REPO = "qfisch/yolov8n-watermark-detection"
 YOLO_FILE = "yolov8n-watermark.onnx"
 
@@ -39,6 +40,17 @@ def parse_args():
     p.add_argument("--variance-threshold", type=float, default=None, help="Variance threshold (default: auto/otsu)")
     p.add_argument("--workers", type=int, default=None, help="Parallel workers (default: CPU count)")
     p.add_argument("--lama", action="store_true", help="Use LaMa neural inpainting (slower, higher quality)")
+    p.add_argument("--mlx", action="store_true", help="Use MLX backend for LaMa (Apple Silicon GPU)")
+    p.add_argument("--flux", action="store_true",
+                   help="Use FLUX.1 Fill inpainting via mflux (MLX-native, highest quality, slow)")
+    p.add_argument("--flux-steps", type=int, default=20, help="FLUX inference steps (default: 20)")
+    p.add_argument("--flux-guidance", type=float, default=30.0, help="FLUX guidance (default: 30.0)")
+    p.add_argument("--flux-quantize", type=int, default=8, choices=[4, 8, 0],
+                   help="FLUX weight quantization bits; 0 = full precision (default: 8)")
+    p.add_argument("--flux-res", type=int, default=512,
+                   help="FLUX crop processing resolution, rounded to /16 (default: 512)")
+    p.add_argument("--flux-prompt", default="background, seamless texture",
+                   help="FLUX fill prompt (must be non-empty; CLIP requires >=1 token)")
     return p.parse_args()
 
 
@@ -348,16 +360,35 @@ def _inpaint_frame_lama(args):
     crop_input = crop_resized.astype(np.float32) / 255.0
     crop_nchw = np.transpose(crop_input, (2, 0, 1))[np.newaxis, ...]  # (1,3,512,512)
 
-    if use_coreml:
-        coreml_model = _get_worker_coreml(lama_model_path)
-        pred = coreml_model.predict({"image": crop_nchw, "mask": mask_input})
-        inpainted = list(pred.values())[0][0]  # (3,512,512)
-    else:
-        session = _get_worker_onnx(lama_model_path)
-        input_name = session.get_inputs()[0].name
-        mask_name = session.get_inputs()[1].name
-        result = session.run(None, {input_name: crop_nchw, mask_name: mask_input})
-        inpainted = result[0][0]  # (3,512,512)
+    import time
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if use_coreml:
+                coreml_model = _get_worker_coreml(lama_model_path)
+                pred = coreml_model.predict({"image": crop_nchw, "mask": mask_input})
+                inpainted = list(pred.values())[0][0]  # (3,512,512)
+            else:
+                session = _get_worker_onnx(lama_model_path)
+                input_name = session.get_inputs()[0].name
+                mask_name = session.get_inputs()[1].name
+                result = session.run(None, {input_name: crop_nchw, mask_name: mask_input})
+                inpainted = result[0][0]  # (3,512,512)
+            break
+        except RuntimeError:
+            if attempt < max_retries - 1:
+                # Clear cached model and retry after brief pause
+                pid = os.getpid()
+                _worker_coreml_cache.pop(pid, None)
+                time.sleep(0.5 * (attempt + 1))
+            else:
+                # Final fallback: OpenCV inpaint
+                mask_u8 = (mask_crop_norm > 0).astype(np.uint8) * 255
+                mask_full = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+                mask_full[y1:y2, x1:x2] = cv2.resize(mask_u8, (crop_w, crop_h))
+                frame = cv2.inpaint(frame, mask_full, inpaintRadius=12, flags=cv2.INPAINT_NS)
+                cv2.imwrite(frame_path, frame)
+                return frame_path
 
     inpainted = np.transpose(inpainted, (1, 2, 0))  # (512,512,3)
     inpainted = np.clip(inpainted * 255, 0, 255).astype(np.uint8)
@@ -392,9 +423,138 @@ def _get_worker_coreml(model_path):
     return _worker_coreml_cache[pid]
 
 
+def _inpaint_frames_mlx(frame_files, crop_box, mask_crop, mlx_model_path):
+    """Inpaint frames sequentially using MLX on Apple Silicon GPU."""
+    import mlx.core as mx
+    from mlx.utils import tree_map
+    from lama_mlx import load_mlx_weights
+
+    x1, y1, x2, y2 = crop_box
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+
+    # Load model
+    model = load_mlx_weights(mlx_model_path)
+    # Convert to fp16
+    model.update(tree_map(lambda p: p.astype(mx.float16), model.parameters()))
+
+    # Compile the forward pass
+    @mx.compile
+    def run(image, mask):
+        return model(image, mask)
+
+    # Precompute mask tensors
+    mask_crop_norm = mask_crop / 255.0
+    mask_512 = cv2.resize(mask_crop_norm, (512, 512), interpolation=cv2.INTER_LINEAR)
+    mask_512_bin = (mask_512 > 0.1).astype(np.float32)
+    mask_input = mx.array(mask_512_bin[np.newaxis, :, :, np.newaxis]).astype(mx.float16)
+    alpha_crop = np.stack([mask_crop_norm] * 3, axis=-1)
+
+    # Warmup
+    dummy_img = mx.zeros((1, 512, 512, 3), dtype=mx.float16)
+    mx.eval(run(dummy_img, mask_input))
+
+    for frame_path in tqdm(frame_files, desc="Inpainting (MLX)", unit="frame"):
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            continue
+
+        crop = frame[y1:y2, x1:x2].copy()
+        crop_resized = cv2.resize(crop, (512, 512), interpolation=cv2.INTER_LINEAR)
+        crop_nhwc = crop_resized.astype(np.float32) / 255.0
+
+        img_mx = mx.array(crop_nhwc[np.newaxis]).astype(mx.float16)
+        result = run(img_mx, mask_input)
+        mx.eval(result)
+
+        inpainted = np.array(result[0].astype(mx.float32))  # (512,512,3) [0,1]
+        inpainted = np.clip(inpainted * 255, 0, 255).astype(np.uint8)
+        inpainted_resized = cv2.resize(inpainted, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+
+        blended = (inpainted_resized.astype(np.float32) * alpha_crop +
+                   crop.astype(np.float32) * (1 - alpha_crop))
+        frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+        cv2.imwrite(str(frame_path), frame)
+
+
+def _inpaint_frames_flux(frame_files, crop_box, mask_crop, flux_opts):
+    """Inpaint frames sequentially using FLUX.1 Fill (mflux, MLX-native).
+
+    FLUX regenerates the whole crop, so we feather-blend its output back over the
+    original (keep original outside the mask). A fixed seed keeps frames consistent.
+    """
+    from mflux.models.flux.variants.fill.flux_fill import Flux1Fill
+
+    x1, y1, x2, y2 = crop_box
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+
+    # Processing resolution must be divisible by 16 for FLUX latent packing.
+    res = max(16, (flux_opts["res"] // 16) * 16)
+
+    # Static mask (white = watermark/hole) and feather alpha, built once.
+    mask_bin = (mask_crop > 0).astype(np.uint8) * 255
+    alpha_crop = np.stack([mask_crop / 255.0] * 3, axis=-1)
+
+    tmp_dir = tempfile.mkdtemp(prefix="dewatermark_flux_")
+    mask_png = os.path.join(tmp_dir, "mask.png")
+    crop_png = os.path.join(tmp_dir, "crop.png")
+    out_png = os.path.join(tmp_dir, "out.png")
+    # FLUX scales the mask to res internally; save at the native crop size.
+    cv2.imwrite(mask_png, mask_bin)
+
+    quantize = flux_opts["quantize"] or None
+    print(f"Loading FLUX.1 Fill (quantize={quantize}, res={res}, "
+          f"steps={flux_opts['steps']}, guidance={flux_opts['guidance']})...")
+    print("  (first run downloads black-forest-labs/FLUX.1-Fill-dev from Hugging Face — "
+          "large, gated; ensure you've accepted its license)")
+    flux = Flux1Fill(quantize=quantize)
+
+    try:
+        for frame_path in tqdm(frame_files, desc="Inpainting (FLUX)", unit="frame"):
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                continue
+
+            crop = frame[y1:y2, x1:x2].copy()
+            try:
+                cv2.imwrite(crop_png, crop)
+                result = flux.generate_image(
+                    seed=0,
+                    prompt=flux_opts["prompt"],
+                    image_path=crop_png,
+                    masked_image_path=mask_png,
+                    width=res,
+                    height=res,
+                    num_inference_steps=flux_opts["steps"],
+                    guidance=flux_opts["guidance"],
+                )
+                result.save(path=out_png)
+                inpainted = cv2.imread(out_png)
+                if inpainted is None:
+                    raise RuntimeError("FLUX produced no output image")
+            except Exception as e:  # noqa: BLE001 — keep the run alive on a bad frame
+                tqdm.write(f"  FLUX failed on {Path(frame_path).name} ({e}); "
+                           "falling back to OpenCV inpaint")
+                mask_full = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+                mask_full[y1:y2, x1:x2] = mask_bin
+                frame = cv2.inpaint(frame, mask_full, inpaintRadius=12, flags=cv2.INPAINT_NS)
+                cv2.imwrite(str(frame_path), frame)
+                continue
+
+            inpainted_resized = cv2.resize(inpainted, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+            blended = (inpainted_resized.astype(np.float32) * alpha_crop +
+                       crop.astype(np.float32) * (1 - alpha_crop))
+            frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+            cv2.imwrite(str(frame_path), frame)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def process_video(input_path, output_path, mask_float, crop_box, info, crf, preset, workers,
-                  lama_model_path=None, use_lama=False):
-    """Extract frames → parallel inpaint → re-encode."""
+                  lama_model_path=None, use_lama=False, use_mlx=False, use_flux=False,
+                  flux_opts=None):
+    """Extract frames → inpaint → re-encode."""
     w, h = info["width"], info["height"]
     fps = info["r_frame_rate"]
     x1, y1, x2, y2 = crop_box
@@ -423,8 +583,14 @@ def process_video(input_path, output_path, mask_float, crop_box, info, crf, pres
         if workers is None:
             workers = min(multiprocessing.cpu_count(), 8)
 
-        # Step 2: Parallel inpaint
-        if use_lama and lama_model_path:
+        # Step 2: Inpaint
+        if use_flux:
+            print("Inpainting with FLUX.1 Fill (mflux, MLX-native)...")
+            _inpaint_frames_flux(frame_files, crop_box, mask_crop, flux_opts)
+        elif use_mlx and os.path.exists(LAMA_MLX_PATH):
+            print("Inpainting with LaMa MLX (Apple Silicon GPU)...")
+            _inpaint_frames_mlx(frame_files, crop_box, mask_crop, LAMA_MLX_PATH)
+        elif use_lama and lama_model_path:
             use_coreml = os.path.exists(LAMA_COREML_PATH)
             mask_crop_norm = mask_crop / 255.0
             mask_512 = cv2.resize(mask_crop_norm, (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -439,17 +605,24 @@ def process_video(input_path, output_path, mask_float, crop_box, info, crf, pres
             backend = "CoreML" if use_coreml else "ONNX"
             print(f"Inpainting with LaMa {backend} ({workers} workers)...")
             worker_fn = _inpaint_frame_lama
+
+            with multiprocessing.Pool(workers, maxtasksperchild=500) as pool:
+                for _ in tqdm(
+                    pool.imap_unordered(worker_fn, task_args),
+                    total=nb_frames, desc="Inpainting", unit="frame"
+                ):
+                    pass
         else:
             task_args = [(str(f), mask_u8) for f in frame_files]
             print(f"Inpainting with OpenCV Telea ({workers} workers)...")
             worker_fn = _inpaint_frame_cv
 
-        with multiprocessing.Pool(workers) as pool:
-            for _ in tqdm(
-                pool.imap(worker_fn, task_args),
-                total=nb_frames, desc="Inpainting", unit="frame"
-            ):
-                pass
+            with multiprocessing.Pool(workers) as pool:
+                for _ in tqdm(
+                    pool.imap(worker_fn, task_args),
+                    total=nb_frames, desc="Inpainting", unit="frame"
+                ):
+                    pass
 
         # Step 3: Re-encode with audio from original
         print("Encoding output video...")
@@ -535,7 +708,27 @@ def main():
             sys.exit(1)
 
     lama_model_path = None
-    if args.lama:
+    use_flux = args.flux
+    flux_opts = None
+    use_mlx = args.mlx and not use_flux
+    if use_flux:
+        flux_opts = {
+            "steps": args.flux_steps,
+            "guidance": args.flux_guidance,
+            "quantize": args.flux_quantize,
+            "res": args.flux_res,
+            "prompt": args.flux_prompt,
+        }
+        print("Using FLUX.1 Fill inpainting (mflux). Model is self-managed via Hugging Face.")
+    elif use_mlx:
+        if not os.path.exists(LAMA_MLX_PATH):
+            print("Converting LaMa ONNX → MLX weights (one-time)...")
+            lama_model_path = download_lama(args.model_dir)
+            from lama_mlx import convert_and_save
+            convert_and_save(lama_model_path, LAMA_MLX_PATH)
+        print(f"LaMa MLX model: {LAMA_MLX_PATH}")
+        args.lama = True
+    elif args.lama:
         print("Downloading LaMa inpainting model...")
         lama_model_path = download_lama(args.model_dir)
         print(f"LaMa model: {lama_model_path}")
@@ -549,7 +742,8 @@ def main():
     print("Processing video...")
     process_video(args.input, args.output, mask_float, crop_box, info,
                   args.crf, args.preset, args.workers,
-                  lama_model_path=lama_model_path, use_lama=args.lama)
+                  lama_model_path=lama_model_path, use_lama=args.lama,
+                  use_mlx=use_mlx, use_flux=use_flux, flux_opts=flux_opts)
     print(f"Done! Output saved to {args.output}")
 
 
